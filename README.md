@@ -5,7 +5,18 @@ pólizas, actas, facturas, anexos) en un paquete navegable (árbol, bloques,
 tablas, texto por página) que un agente (vía CLI o MCP)
 consulta sin cargar el documento completo.
 
+## Requisitos
+
+| Vía de instalación | Qué necesitas |
+|---|---|
+| **Binario del release** | **Nada.** Descárgalo de [Releases](https://github.com/Tanok-Tech/pdfidxtk-oss/releases), dale permiso de ejecución y ponlo en el `PATH`. |
+| **`cargo install` / compilar** | **Rust primero** ([rustup.rs](https://rustup.rs)) + un enlazador: Xcode Command Line Tools en macOS (`xcode-select --install`), Visual Studio Build Tools (workload C++) en Windows, `build-essential` en Linux. |
+| **OCR de páginas escaneadas** (opcional) | `tesseract` + paquetes de idioma (`tesseract-lang` en macOS). |
+
+Al terminar, verifica con `pitk --version`.
+
 ## Instalación
+
 
 Sin Rust: descarga el binario de tu sistema desde
 [Releases](https://github.com/Tanok-Tech/pdfidxtk-oss/releases) y ponlo en el `PATH`.
@@ -40,8 +51,7 @@ El core no asume dominio: indexa y navega cualquier PDF.
   autorizaciones, soporte): candidatos con evidencia, nunca veredictos.
 - El resto de las órdenes (`info`, `index`, `tree`, `dates`, `search`, `find`,
   `when`, `render`, `serve`, `prune`, `optimize`) trabajan sobre PDFs en general.
-- Caso de uso validado: facturación de salud (ver
-  [Caso de uso validado](#caso-de-uso-validado)).
+- Caso de uso validado: facturación de salud (ver [Validación](#validación)).
 
 ## Garantías de diseño
 
