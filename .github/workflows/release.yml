@@ -1,0 +1,45 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+            asset: pitk-macos-arm64
+          - os: macos-14
+            target: x86_64-apple-darwin
+            asset: pitk-macos-x86_64
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            asset: pitk-linux-x86_64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset: pitk-windows-x86_64.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Empaquetar
+        shell: bash
+        run: |
+          BIN="target/${{ matrix.target }}/release/pitk"
+          [ -f "$BIN.exe" ] && BIN="$BIN.exe"
+          cp "$BIN" "${{ matrix.asset }}"
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.asset }}
+          generate_release_notes: true
