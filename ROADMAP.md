@@ -4,11 +4,11 @@
 
 ## Arranque rápido
 
-1. `cargo test` → debe dar **47/47** (26 unit + 20 integración).
+1. `cargo test` → debe dar **51/51** (30 unit + 21 integración).
 2. `cargo install --path . --locked` → `pitk` en `~/.cargo/bin`.
 3. Guía de integración con agentes: [`docs/INTEGRACION-AGENTES.md`](docs/INTEGRACION-AGENTES.md).
 
-## Estado: v0.4.0
+## Estado: v0.5.0
 
 | Fase | Qué aportó |
 |---|---|
@@ -19,11 +19,12 @@
 | v2b | `tree_optimize` (fusión de nodos), `pitk optimize`, `tree.raw.json` |
 | v0.3.0 | `pitk dossier` (papel de trabajo MD/JSON), `pitk tree` (índice navegable), integración CLI |
 | v0.4.0 | `pitk flags` (candidatos con evidencia), `pitk find`/`pitk when`, recibos que sobreviven a `index --force` |
+| v0.5.0 | **Lectura completa garantizada**: extracción por fragmentos (sin la carrera de `pdf_oxide`), `failed_pages`/`encrypted` en `meta.json`, búsqueda insensible a tabuladores |
 
 **Validación:** cuentas reales de auditoría (documentos y cifras de los casos no se
-publican) y **47 tests** (26 unit + 20 integración).
+publican) y **51 tests** (30 unit + 21 integración).
 
-## Comandos (v0.4.0)
+## Comandos (v0.5.0)
 
 ```bash
 pitk init --account <CASO> .       # crea .docidx/ + PDFIDXTK-USO.md (para el prompt)
@@ -100,6 +101,6 @@ de las 8 órdenes y SIN pedir ayuda humana intermedia.
 ## Convenciones
 
 - Commits atómicos con **qué y por qué**; versión en `Cargo.toml`.
-- `cargo test` 47/47 antes de cada commit.
+- `cargo test` 51/51 antes de cada commit.
 - Datos personales o sensibles: solo en carpetas de casos privados, jamás en el repo.
 - El motor **no lee** normativa: `init` solo escribe `PDFIDXTK-USO.md` con las órdenes.

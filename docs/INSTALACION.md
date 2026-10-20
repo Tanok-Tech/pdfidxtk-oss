@@ -93,7 +93,7 @@ toolchain de Rust y compila (~1 min).
 ## Verificación en cualquier máquina
 
 ```bash
-pitk --version          # pitk 0.4.0
+pitk --version          # pitk 0.5.0
 pitk init --help
 ```
 

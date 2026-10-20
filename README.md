@@ -65,6 +65,11 @@ El core no asume dominio: indexa y navega cualquier PDF.
   archivos inmutables. Varias sesiones pueden trabajar a la vez.
 - **Pérdida detectable**: `meta.json` declara por página el modo de extracción,
   caracteres, tablas, imágenes, páginas ilegibles y anomalías de encoding.
+- **Lectura completa**: ninguna página se pierde en silencio. Si una página no
+  se puede leer queda en `extraction.failed_pages` con su motivo; si el PDF está
+  cifrado con contraseña se declara en `extraction.encrypted` (no es un PDF
+  escaneado: el OCR no puede abrirlo). La extracción es determinista: el mismo
+  PDF produce siempre el mismo resultado, página por página.
 - **Solo evidencia**: `pitk` no conoce las reglas de auditoría, no emite
   veredictos ni objeciones y no lee los MD normativos del auditor. Entrega
   ítems, páginas, soportes y ausencias fechadas; la calificación es del auditor.

@@ -414,6 +414,11 @@ fn build_artifacts(
     let mut total_images = 0usize;
 
     let mut ocr_done: Vec<usize> = Vec::new();
+    let failure_by_page: std::collections::HashMap<usize, String> = extracted
+        .failed_pages
+        .iter()
+        .map(|f| (f.page, f.error.clone()))
+        .collect();
     for page in pages {
         let chars: usize = page.lines.iter().map(|l| l.text.chars().count()).sum();
         let mode = if chars > 0 && page.ocr {
@@ -446,16 +451,27 @@ fn build_artifacts(
             tables: page.tables.len(),
             images: page.images,
             illegible: chars == 0 || page.garbled_ratio > 0.5,
+            error: failure_by_page.get(&page.page).cloned(),
         });
     }
 
     let mut warnings = Vec::new();
-    if !empty_pages.is_empty() {
-        warnings.push(format!(
-            "{} página(s) sin texto extraíble: {:?}. Requieren OCR o inspección visual.",
-            empty_pages.len(),
-            empty_pages
-        ));
+    if !empty_pages.is_empty() && !extracted.encrypted {
+        // Las páginas NO legibles tienen su propio aviso más abajo: pedirles
+        // OCR sería un diagnóstico falso (el OCR no puede abrir lo que no se
+        // pudo leer, igual que no puede abrir un PDF cifrado).
+        let no_legibles: Vec<usize> = extracted.failed_pages.iter().map(|f| f.page).collect();
+        let sin_diagnóstico: Vec<&usize> = empty_pages
+            .iter()
+            .filter(|p| !no_legibles.contains(p))
+            .collect();
+        if !sin_diagnóstico.is_empty() {
+            warnings.push(format!(
+                "{} página(s) sin texto extraíble: {:?}. Requieren OCR o inspección visual.",
+                sin_diagnóstico.len(),
+                sin_diagnóstico
+            ));
+        }
     }
     if !ocr_required.is_empty() {
         warnings.push(format!(
@@ -475,6 +491,26 @@ fn build_artifacts(
             "{} página(s) con posible texto ilegible (garbled ratio > 10%): {:?}",
             garbled_pages.len(),
             garbled_pages
+        ));
+    }
+    if !extracted.failed_pages.is_empty() {
+        let pages: Vec<usize> = extracted.failed_pages.iter().map(|f| f.page).collect();
+        warnings.push(format!(
+            "{} página(s) NO se pudieron leer (quedan declaradas, no se pierden en silencio): {:?}. \
+             Verificar con render o inspección visual del PDF original.",
+            pages.len(),
+            pages
+        ));
+        for f in &extracted.failed_pages {
+            warnings.push(format!("página {}: {}", f.page, f.error));
+        }
+    }
+    if extracted.encrypted {
+        warnings.push(format!(
+            "El PDF está CIFRADO con contraseña: no se pudo leer el contenido de ninguna de sus \
+             {} página(s). No es un documento escaneado y el OCR no puede ayudar: \
+             hace falta el PDF desprotegido o su contraseña.",
+            extracted.pages
         ));
     }
 
@@ -508,6 +544,12 @@ fn build_artifacts(
             total_tables,
             total_images,
             garbled_pages,
+            failed_pages: extracted
+                .failed_pages
+                .iter()
+                .map(|f| f.page)
+                .collect(),
+            encrypted: extracted.encrypted,
         },
         warnings,
     };

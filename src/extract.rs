@@ -5,7 +5,6 @@
 
 use anyhow::{Context, Result};
 use pdf_oxide::document::PdfDocument;
-use pdf_oxide::layout::text_block::TextLine;
 use rayon::prelude::*;
 use std::path::Path;
 
@@ -51,30 +50,218 @@ pub struct ExtractedDoc {
     pub page_data: Vec<PageData>,
     /// Líneas donde hubo que reparar mojibake (pérdida de encoding detectada).
     pub encoding_repairs: usize,
+    /// Páginas que no se pudieron leer. Se registran; nunca se pierden en silencio.
+    pub failed_pages: Vec<PageFailure>,
+    /// El PDF está cifrado y su contenido no se pudo descifrar (contraseña).
+    /// En ese caso el texto sale vacío: no es un PDF escaneado, y el OCR no
+    /// puede ayudar. El auditor tiene que saber la diferencia.
+    pub encrypted: bool,
 }
 
+/// Una página que no se pudo leer, con el motivo.
+#[derive(Debug, Clone)]
+pub struct PageFailure {
+    /// 1-based
+    pub page: usize,
+    pub error: String,
+}
+
+/// Extrae el documento completo sin perder páginas.
+///
+/// `pdf_oxide` 0.3.78 resuelve las páginas sobre un `PdfDocument` compartido
+/// con un cache mutable. Con acceso concurrente al mismo handle, la carrera
+/// entre el recorrido masivo del árbol (`populate_page_cache`) y las traversals
+/// por página produce dos fallos distintos:
+///
+/// 1. Una página se resuelve a `Null` → el cache queda desalineado y el texto
+///    de esa página se pierde **en silencio** (mismo número de páginas, menos
+///    caracteres extraídos).
+/// 2. La resolución aborta con `Invalid PDF: Page index N not found by scanning`
+///    → el documento entero no se indexa.
+///
+/// Por eso el trabajo se reparte en *fragmentos* y cada fragmento abre **su
+/// propio** `PdfDocument`: sin estado mutable compartido, la extracción es
+/// determinista y completa. El número de fragmentos sólo afecta al
+/// rendimiento, nunca al resultado.
+///
+/// Encima de eso hay una garantía de completitud: toda página faltante se
+/// reintenta en serie con un handle nuevo y, si tampoco se puede leer, queda
+/// registrada como error explícito. El documento se indexa igual, pero el
+/// auditor ve exactamente qué páginas quedaron fuera — nunca un hueco
+/// silencioso.
 pub fn extract_document(path: &Path) -> Result<ExtractedDoc> {
-    let doc = PdfDocument::open(path)
-        .with_context(|| format!("pdf_oxide no pudo abrir {}", path.display()))?;
-    let pages = doc.page_count().context("no se pudo leer el número de páginas")?;
+    extract_document_with_shards(path, 0)
+}
 
-    let mut page_data: Vec<PageData> = (0..pages)
-        .into_par_iter()
-        .map(|i| extract_page(&doc, i).with_context(|| format!("página {}", i + 1)))
-        .collect::<Result<Vec<_>>>()?;
+/// Igual que [`extract_document`], pero con el número de fragmentos fijado.
+///
+/// `shards == 0` lo decide el tamaño del documento. Fijarlo existe para
+/// poder demostrar en test que el resultado NO depende del número de
+/// fragmentos: es la garantía que hace seguro paralelizar.
+pub(crate) fn extract_document_with_shards(path: &Path, shards: usize) -> Result<ExtractedDoc> {
+    let (page_count, encrypted) = {
+        let doc = PdfDocument::open(path)
+            .with_context(|| format!("pdf_oxide no pudo abrir {}", path.display()))?;
+        (
+            doc.page_count().context("no se pudo leer el número de páginas")?,
+            doc.is_encrypted(),
+        )
+    };
 
+    let ranges = shard_ranges(page_count, shards);
+    let shards: Vec<Vec<PageData>> = ranges
+        .par_iter()
+        .map(|(from, to)| extract_shard(path, *from, *to))
+        .collect();
+
+    let mut page_data: Vec<PageData> = Vec::with_capacity(page_count);
+    for shard in shards {
+        page_data.extend(shard);
+    }
     page_data.sort_by_key(|p| p.page);
+
+    // ── Garantía de completitud ────────────────────────────────────────────
+    // Toda página 1..=N debe terminar con exactamente un resultado.
+    let missing = missing_pages(&page_data, page_count);
+    let mut failed_pages: Vec<PageFailure> = Vec::new();
+    if !missing.is_empty() {
+        let (recovered, still_failing) = retry_pages(path, &missing);
+        page_data.extend(recovered);
+        // Las páginas irrecuperables conservan su lugar: la numeración queda
+        // contigua y el artefacto refleja el hueco real, no un corrimiento.
+        page_data.extend(still_failing.iter().map(|f| empty_page(f.page)));
+        failed_pages = still_failing;
+        page_data.sort_by_key(|p| p.page);
+    }
+
     let encoding_repairs = page_data
         .iter()
         .flat_map(|p| p.lines.iter())
         .filter(|l| l.repaired || l.text.contains('Ã') || l.text.contains('\u{FFFD}'))
         .count();
 
+    let total_chars: usize = page_data.iter().map(|p| p.text_chars()).sum();
+
     Ok(ExtractedDoc {
-        pages,
+        pages: page_count,
         page_data,
         encoding_repairs,
+        failed_pages,
+        // Cifrado con contraseña: sale sin texto y el OCR no puede abrirlo.
+        encrypted: encrypted && total_chars == 0,
     })
+}
+
+/// Nº de fragmentos: 1 para documentos pequeños, hasta 8 para los grandes.
+fn plan_shards(page_count: usize) -> usize {
+    /// Páginas mínimas por fragmento. Por debajo de esto, abrir otro handle
+    /// cuesta más de lo que ahorra.
+    const MIN_PAGES_PER_SHARD: usize = 24;
+    if page_count < MIN_PAGES_PER_SHARD * 2 {
+        return 1;
+    }
+    let cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    cpus.clamp(1, 8)
+        .min(page_count.div_ceil(MIN_PAGES_PER_SHARD))
+}
+
+/// Reparte `0..page_count` en rangos contiguos `[from, to)`.
+fn shard_ranges(page_count: usize, shards: usize) -> Vec<(usize, usize)> {
+    if page_count == 0 {
+        return Vec::new();
+    }
+    let shards = if shards == 0 {
+        plan_shards(page_count)
+    } else {
+        shards.min(page_count)
+    };
+    if shards <= 1 {
+        return vec![(0, page_count)];
+    }
+    let per = page_count.div_ceil(shards);
+    let mut out = Vec::with_capacity(shards);
+    let mut start = 0usize;
+    while start < page_count {
+        let end = (start + per).min(page_count);
+        out.push((start, end));
+        start = end;
+    }
+    out
+}
+
+/// Extrae un rango de páginas con un handle exclusivo del fragmento.
+/// Las páginas que fallan se omiten aquí y se reintentan en serie después.
+fn extract_shard(path: &Path, from: usize, to: usize) -> Vec<PageData> {
+    let mut pages = Vec::with_capacity(to - from);
+    let Ok(doc) = PdfDocument::open(path) else {
+        // Sin handle no hay páginas; el reintento en serie lo intentará de nuevo.
+        return pages;
+    };
+    for i in from..to {
+        if let Ok(page) = extract_page(&doc, i) {
+            pages.push(page);
+        }
+    }
+    pages
+}
+
+/// Reintenta en serie las páginas que faltaron, con un handle nuevo.
+/// Devuelve (páginas recuperadas, páginas irrecuperables).
+fn retry_pages(path: &Path, missing: &[usize]) -> (Vec<PageData>, Vec<PageFailure>) {
+    let mut recovered = Vec::new();
+    let mut failures = Vec::new();
+    let Ok(doc) = PdfDocument::open(path) else {
+        for &page_index in missing {
+            failures.push(PageFailure {
+                page: page_index + 1,
+                error: "no se pudo abrir el PDF para el reintento en serie".to_string(),
+            });
+        }
+        return (recovered, failures);
+    };
+    for &page_index in missing {
+        match extract_page(&doc, page_index) {
+            Ok(page) => recovered.push(page),
+            Err(e) => failures.push(PageFailure {
+                page: page_index + 1,
+                error: format!("{:#}", e),
+            }),
+        }
+    }
+    (recovered, failures)
+}
+
+/// Índices (0-based) de las páginas sin resultado.
+fn missing_pages(page_data: &[PageData], page_count: usize) -> Vec<usize> {
+    let mut present = vec![false; page_count];
+    for p in page_data {
+        if p.page >= 1 && p.page <= page_count {
+            present[p.page - 1] = true;
+        }
+    }
+    present
+        .iter()
+        .enumerate()
+        .filter(|(_, ok)| !**ok)
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// Marcador de una página que no se pudo leer: conserva la numeración.
+fn empty_page(page: usize) -> PageData {
+    PageData {
+        page,
+        lines: Vec::new(),
+        tables: Vec::new(),
+        images: 0,
+        classifier_kind: "Unreadable".to_string(),
+        ocr: false,
+        garbled_ratio: 0.0,
+        invisible_text_ratio: 0.0,
+        text_glyph_count: 0,
+    }
 }
 
 fn extract_page(doc: &PdfDocument, page_index: usize) -> Result<PageData> {
@@ -326,4 +513,124 @@ fn is_bold(weight: pdf_oxide::layout::text_block::FontWeight) -> bool {
             | pdf_oxide::layout::text_block::FontWeight::ExtraBold
             | pdf_oxide::layout::text_block::FontWeight::Black
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    /// PDF sintético de `n` páginas. Cada página lleva un marcador único
+    /// (`PAGINA <n> UNICA`) para detectar páginas perdidas o desplazadas.
+    fn pdf_con_n_paginas(n: usize) -> Vec<u8> {
+        let mut bodies: Vec<String> = Vec::with_capacity(3 + n * 2);
+        bodies.push("<< /Type /Catalog /Pages 2 0 R >>".to_string());
+        let kids: Vec<String> = (0..n).map(|i| format!("{} 0 R", 4 + 2 * i)).collect();
+        bodies.push(format!(
+            "<< /Type /Pages /Kids [{}] /Count {} >>",
+            kids.join(" "),
+            n
+        ));
+        bodies.push("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_string());
+        for i in 0..n {
+            let content = format!("BT /F1 12 Tf 20 100 Td (PAGINA {} UNICA) Tj ET", i + 1);
+            bodies.push(format!(
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 200] /Contents {} 0 R \
+                 /Resources << /Font << /F1 3 0 R >> >> >>",
+                5 + 2 * i
+            ));
+            bodies.push(format!(
+                "<< /Length {} >>\nstream\n{}\nendstream",
+                content.len(),
+                content
+            ));
+        }
+
+        let mut out: Vec<u8> = b"%PDF-1.4\n".to_vec();
+        let mut offsets = Vec::new();
+        for (i, body) in bodies.iter().enumerate() {
+            offsets.push(out.len());
+            out.extend_from_slice(format!("{} 0 obj\n{}\nendobj\n", i + 1, body).as_bytes());
+        }
+        let xref_off = out.len();
+        out.extend_from_slice(format!("xref\n0 {}\n", bodies.len() + 1).as_bytes());
+        out.extend_from_slice(b"0000000000 65535 f \n");
+        for off in &offsets {
+            out.extend_from_slice(format!("{:010} 00000 n \n", off).as_bytes());
+        }
+        out.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n",
+                bodies.len() + 1,
+                xref_off
+            )
+            .as_bytes(),
+        );
+        out
+    }
+
+    fn texto_de(doc: &ExtractedDoc) -> Vec<String> {
+        doc.page_data
+            .iter()
+            .map(|p| p.lines.iter().map(|l| l.text.clone()).collect::<Vec<_>>().join("|"))
+            .collect()
+    }
+
+    /// El número de fragmentos es una decisión de rendimiento, nunca de
+    /// resultado. Si alguna vez deja de serlo, la paralelización está rota.
+    #[test]
+    fn resultado_no_depende_del_numero_de_fragmentos() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("many.pdf");
+        fs::write(&path, pdf_con_n_paginas(120)).unwrap();
+
+        let reference = extract_document_with_shards(&path, 1).unwrap();
+        assert_eq!(reference.pages, 120);
+        assert_eq!(reference.page_data.len(), 120);
+        assert!(reference.failed_pages.is_empty());
+        let ref_texto = texto_de(&reference);
+
+        for shards in [2usize, 3, 7, 8, 16] {
+            let got = extract_document_with_shards(&path, shards).unwrap();
+            assert_eq!(got.pages, reference.pages, "shards={shards}");
+            assert_eq!(got.page_data.len(), reference.page_data.len(), "shards={shards}");
+            assert_eq!(texto_de(&got), ref_texto, "el texto cambió con shards={shards}");
+        }
+    }
+
+    /// Ninguna página se pierde y ninguna queda desplazada: cada página
+    /// conserva su marcador. Es el invariante que rompe la carrera de
+    /// `pdf_oxide` cuando varias hilos comparten un mismo `PdfDocument`.
+    #[test]
+    fn ninguna_pagina_se_pierde_ni_se_desplaza() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("many.pdf");
+        let n = 120usize;
+        fs::write(&path, pdf_con_n_paginas(n)).unwrap();
+
+        let doc = extract_document(&path).unwrap();
+        assert_eq!(doc.pages, n);
+        assert_eq!(doc.page_data.len(), n, "faltan páginas en el resultado");
+        assert!(
+            doc.failed_pages.is_empty(),
+            "páginas fallidas: {:?}",
+            doc.failed_pages
+        );
+
+        for (i, page) in doc.page_data.iter().enumerate() {
+            assert_eq!(page.page, i + 1, "numeración no contigua");
+            let texto = page
+                .lines
+                .iter()
+                .map(|l| l.text.as_str())
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert!(
+                texto.contains(&format!("PAGINA {} UNICA", i + 1)),
+                "la página {} no contiene su marcador (contenido: {:?})",
+                i + 1,
+                texto
+            );
+        }
+    }
 }

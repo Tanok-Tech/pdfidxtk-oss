@@ -779,3 +779,66 @@ fn reindex_preserva_recibos_de_busqueda() {
     );
     assert_eq!(before, fs::read_to_string(&receipt).unwrap(), "recibo alterado");
 }
+
+/// Un PDF cifrado con contraseña no se puede leer: sale sin texto.
+/// El auditor tiene que enterarse de que NO es un PDF escaneado (el OCR no
+/// puede abrirlo) sino un PDF protegido.
+#[test]
+fn pdf_cifrado_se_declara_como_cifrado_y_no_como_escaneado() {
+    // requiere qpdf; si no está, el test se omite
+    if Command::new("qpdf").arg("--version").output().is_err() {
+        eprintln!("qpdf no disponible; omitido");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path().join("ws");
+    fs::create_dir_all(&ws).unwrap();
+
+    let plano = ws.join("plano.pdf");
+    fs::write(&plano, tiny_pdf()).unwrap();
+    let cifrado = ws.join("cifrado.pdf");
+    let ok = Command::new("qpdf")
+        .args(["--encrypt", "clave", "clave", "256", "--"])
+        .arg(&plano)
+        .arg(&cifrado)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !ok {
+        eprintln!("qpdf no pudo cifrar; omitido");
+        return;
+    }
+    // el PDF cifrado no se puede leer, pero sí indexar: el hueco queda declarado
+    fs::remove_file(&plano).unwrap();
+
+    let out = pitk().arg("init").arg("--account").arg("ENC").arg(&ws).output().unwrap();
+    assert!(out.status.success());
+    let out = pitk().arg("index").arg(&ws).output().unwrap();
+    assert!(
+        out.status.success(),
+        "index falló: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let docs = ws.join(".docidx").join("docs");
+    let doc_dir = docs.read_dir().unwrap().next().unwrap().unwrap().path();
+    let meta: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(doc_dir.join("meta.json")).unwrap()).unwrap();
+
+    assert_eq!(meta["extraction"]["encrypted"], serde_json::json!(true));
+    let avisos: Vec<String> = meta["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|w| w.as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        avisos.iter().any(|w| w.contains("CIFRADO")),
+        "debe avisar que el PDF está cifrado: {avisos:?}"
+    );
+    assert!(
+        !avisos.iter().any(|w| w.contains("Requieren OCR")),
+        "un PDF cifrado no es escaneado: no debe pedir OCR: {avisos:?}"
+    );
+}

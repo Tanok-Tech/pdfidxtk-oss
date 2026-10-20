@@ -222,9 +222,28 @@ pub struct TermHit {
 }
 
 /// Normaliza para búsqueda: minúsculas + sin acentos (y mojibake común).
+/// Normalización común de texto y de consulta: minúsculas sin acentos y
+/// separadores colapsados a un solo espacio.
+///
+/// Lo de los separadores importa: el texto que se extrae de algunos PDFs
+/// separa palabras con tabuladores en vez de espacios. Un texto con tabs no
+/// coincide con una consulta con espacios, y una frase que SÍ existe en la
+/// página se reporta como ausente — que en una auditoría es una prueba de
+/// ausencia inválida. Se normalizan ambos lados por la misma función, así la
+/// comparación es simétrica.
 pub fn fold(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
+    let mut pending_sep = false;
     for c in s.to_lowercase().chars() {
+        if c.is_whitespace() {
+            // Espacios, tabs, saltos de línea: todos equivalentes.
+            pending_sep = !out.is_empty();
+            continue;
+        }
+        if pending_sep {
+            out.push(' ');
+            pending_sep = false;
+        }
         let mapped = match c {
             'á' | 'à' | 'ä' | 'â' | 'ã' => 'a',
             'é' | 'è' | 'ë' | 'ê' => 'e',
@@ -398,5 +417,30 @@ mod tests {
         assert_eq!(hits[1].hits, 1);
         assert_eq!(hits[2].hits, 0);
         assert!(hits[2].pages.is_empty());
+    }
+
+    /// El texto de algunos PDFs separa palabras con tabuladores en vez de
+    /// espacios. Si la búsqueda no normaliza ese separador, una frase que sí
+    /// existe en la página se reporta como AUSENTE. En una auditoría eso es
+    /// una prueba de ausencia inválida, que puede sostener una conclusión indebida.
+    #[test]
+    fn frases_con_tabs_no_producen_ausentes_falsos() {
+        let blocks = vec![block(
+            "b1",
+            7,
+            "insuficiencia\trespiratoria\tbilateral\tausente\thoy",
+        )];
+
+        let hits = search_blocks(&blocks, &["insuficiencia respiratoria bilateral".into()]);
+        assert_eq!(
+            hits[0].hits, 1,
+            "la frase existe en la página: no debe reportarse como ausente"
+        );
+        assert_eq!(hits[0].pages, vec![7]);
+
+        // y una ausencia real sigue midiendo 0
+        let hits = search_blocks(&blocks, &["pulmon derecho".into()]);
+        assert_eq!(hits[0].hits, 0);
+        assert!(hits[0].pages.is_empty());
     }
 }

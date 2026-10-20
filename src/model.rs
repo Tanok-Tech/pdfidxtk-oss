@@ -81,6 +81,9 @@ pub struct PageStat {
     pub images: usize,
     /// true si la página es sospechosa (0 chars, o glifos ilegibles)
     pub illegible: bool,
+    /// Motivo por el que la página no se pudo leer (si aplica).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -97,6 +100,14 @@ pub struct ExtractionSummary {
     pub total_images: usize,
     /// Páginas con texto extraído pero alta proporción de caracteres de reemplazo
     pub garbled_pages: Vec<usize>,
+    /// Páginas que NO se pudieron leer. El documento se indexa igual, pero el
+    /// hueco queda declarado: nunca se pierde una página en silencio.
+    #[serde(default)]
+    pub failed_pages: Vec<usize>,
+    /// El PDF está cifrado con contraseña: su contenido no se pudo leer y el
+    /// OCR no puede ayudar. Es un caso distinto de "PDF escaneado".
+    #[serde(default)]
+    pub encrypted: bool,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
